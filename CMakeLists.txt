@@ -30,9 +30,10 @@ set(PICO_PLATFORM rp2350 CACHE STRING "CPU type")
 include(pico_sdk_import.cmake)
 
 # Project
-project(pico-pibot-firmware VERSION 0.1 LANGUAGES C CXX ASM)
+project(picobot-firmware VERSION 0.1 LANGUAGES C CXX ASM)
 
 # Initialise the Raspberry Pi Pico SDK
+# set(TINYUSB_OPT_OS "OPT_OS_FREERTOS" CACHE STRING "TinyUSB OS to use")
 pico_sdk_init()
 
 # Add project sources

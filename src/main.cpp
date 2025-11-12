@@ -24,6 +24,7 @@
 #include <rcl/error_handling.h>
 #include <rclc/rclc.h>
 #include <rclc/executor.h>
+#include <geometry_msgs/msg/twist.h>
 #include <std_msgs/msg/float32.h>
 #include <std_msgs/msg/string.h>
 #include <sensor_msgs/msg/laser_scan.h>
@@ -45,6 +46,42 @@ static volatile size_t lidar_read_pos = 0;
 static int lidar_dma_chan_a;
 static int lidar_dma_chan_b;
 
+struct LidarMsg {
+    sensor_msgs__msg__LaserScan scan{};
+    float scans[360] = {};
+    float intensities[360] = {};
+    char *frame_id = nullptr;
+
+    LidarMsg() : LidarMsg("map") {}
+
+    LidarMsg(const char *frame_id_) {
+        scan.angle_min = 0;
+        scan.angle_max = 2 * PI;
+        scan.angle_increment = PI / 180.f;
+        scan.time_increment = (1.f / 5.f) / 360.f;
+        scan.scan_time = (1.f / 5.f);
+        scan.range_min = 0.15f;
+        scan.range_max = 6.0f;
+
+        frame_id = strdup(frame_id_);
+        scan.header.frame_id.data = frame_id;
+        scan.header.frame_id.size = 3;
+        scan.header.frame_id.capacity = 3;
+
+        scan.ranges.data = scans;
+        scan.ranges.size = 360;
+        scan.ranges.capacity = 360;
+
+        scan.intensities.data = intensities;
+        scan.intensities.size = 360;
+        scan.intensities.capacity = 360;
+    }
+
+    ~LidarMsg() {
+        free(frame_id);
+    }
+};
+
 // RTOS flags
 bool stop_publishers = false;
 bool error_detected = false;
@@ -58,13 +95,26 @@ TaskHandle_t tilt_sweep_task_handle = nullptr;
 // RTOS Semaphores
 SemaphoreHandle_t lidar_task_semaphore = nullptr;
 
-// micro-ROS publishers
-rcl_publisher_t statistics_publisher{};
-rcl_publisher_t lidar_scan_publisher{};
-rcl_publisher_t lidar_rpm_publisher{};
+// RTOS Queues
+QueueHandle_t lidar_scan_queue = nullptr;
+QueueHandle_t lidar_scan_release_queue = nullptr;
+QueueHandle_t lidar_rpm_queue = nullptr;
+
+// micro-ROS guard conditions
+rcl_guard_condition_t lidar_scan_condition{};
+rcl_guard_condition_t lidar_rpm_condition{};
 
 // Main micro-ROS communication task
 void main_task(__unused void *params) {
+    // micro-ROS publishers
+    static rcl_publisher_t statistics_publisher{};
+    static rcl_publisher_t lidar_scan_publisher{};
+    static rcl_publisher_t lidar_rpm_publisher{};
+
+    // micro-ROS subscribers
+    rcl_subscription_t cmd_vel_subscription{};
+
+    // micro-ROS executor stuff
     rcl_allocator_t allocator = rcl_get_default_allocator();
     rcl_node_t node{};
     rclc_support_t support{};
@@ -79,20 +129,32 @@ void main_task(__unused void *params) {
 
         // synchronize with the micro-ROS agent
         constexpr const int timeout_ms = 1000;
-        constexpr const uint8_t attempts = 10;
+        constexpr const uint8_t attempts = 255;
         if (rmw_uros_ping_agent(timeout_ms, attempts) != RCL_RET_OK) {
             continue;
         }
 
         // start micro-ROS executor
         rclc_support_init(&support, 0, NULL, &allocator);
+
+        rcl_guard_condition_init(&lidar_scan_condition, &support.context,
+                rcl_guard_condition_get_default_options());
+        rcl_guard_condition_init(&lidar_rpm_condition, &support.context,
+                rcl_guard_condition_get_default_options());
+
         rclc_node_init_default(&node, "firmware", "", &support);
+
         rclc_publisher_init_default(&statistics_publisher, &node,
                 ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, String), "firmware_runtime_stats");
         rclc_publisher_init_default(&lidar_rpm_publisher, &node,
                 ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float32), "laser_rpm");
         rclc_publisher_init_default(&lidar_scan_publisher, &node,
                 ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, LaserScan), "laser_scan");
+
+        geometry_msgs__msg__Twist cmd_vel_msg{};
+        rclc_subscription_init_default(&cmd_vel_subscription, &node,
+                ROSIDL_GET_MSG_TYPE_SUPPORT(geometry_msgs, msg, Twist), "cmd_vel");
+
         rclc_timer_init_default2(&statistics_timer, &support, RCL_MS_TO_NS(2500),
                 [] (rcl_timer_t *timer, int64_t last_call_time) {
             char runtime_stats[1024];
@@ -113,8 +175,56 @@ void main_task(__unused void *params) {
                 error_detected = true;
             }
         }, true);
+
         rclc_executor_init(&executor, &support.context, 10, &allocator);
+
         rclc_executor_add_timer(&executor, &statistics_timer);
+
+        rclc_executor_add_subscription(&executor, &cmd_vel_subscription, &cmd_vel_msg,
+                [] (const void* msgin) {
+            geometry_msgs__msg__Twist& twist = *(geometry_msgs__msg__Twist*) msgin;
+
+            // map twist onto motors
+            set_motor_left_speed(twist.linear.x - twist.angular.z);
+            set_motor_right_speed(twist.linear.x + twist.angular.z);
+        }, ON_NEW_DATA);
+
+        rclc_executor_add_guard_condition(&executor, &lidar_scan_condition,
+                [] () {
+            while (1) {
+                // attempt dequeue a message from the lidar
+                LidarMsg *msg = nullptr;
+                if (xQueueReceive(lidar_scan_queue, &msg, 0) != pdPASS) {
+                    return;
+                }
+
+                // send lidar scan
+                auto rc = rcl_publish(&lidar_scan_publisher, &msg->scan, NULL);
+                if (rc != RCL_RET_OK) {
+                    error_detected = true;
+                }
+
+                // return lidar message
+                // TODO: this failing leaks memory
+                xQueueSend(lidar_scan_release_queue, &msg, 0);
+            }
+        });
+        rclc_executor_add_guard_condition(&executor, &lidar_rpm_condition,
+                [] () {
+            while (1) {
+                // attempt dequeue a message from the lidar
+                std_msgs__msg__Float32 msg{};
+                if (xQueueReceive(lidar_rpm_queue, &msg.data, 0) != pdPASS) {
+                    return;
+                }
+
+                // send lidar scan
+                auto rc = rcl_publish(&lidar_rpm_publisher, &msg, NULL);
+                if (rc != RCL_RET_OK) {
+                    error_detected = true;
+                }
+            }
+        });
 
         // start the lidar task
         xSemaphoreGive(lidar_task_semaphore);
@@ -125,13 +235,23 @@ void main_task(__unused void *params) {
             if (rc != RCL_RET_OK && rc != RCL_RET_TIMEOUT) {
                 error_detected = true;
             }
-            vTaskDelay(pdMS_TO_TICKS(10));
+            vTaskDelay(pdMS_TO_TICKS(1));
         }
 
-        // stop the lidar task
+        // stop motors
+        set_motor_left_speed(0.f);
+        set_motor_right_speed(0.f);
+
+        // stop lidar
         stop_publishers = true;
         while (xSemaphoreTake(lidar_task_semaphore, portMAX_DELAY) != pdTRUE) {
             // nothing to do
+        }
+
+        // drain lidar queues
+        LidarMsg *msg = nullptr;
+        while (xQueueReceive(lidar_scan_queue, &msg, 0) == pdPASS) {
+            xQueueSend(lidar_scan_release_queue, &msg, 0);
         }
 
         // stop micro-ROS executor
@@ -141,6 +261,8 @@ void main_task(__unused void *params) {
         rcl_publisher_fini(&statistics_publisher, &node);
         rclc_executor_fini(&executor);
         rcl_node_fini(&node);
+        rcl_guard_condition_fini(&lidar_scan_condition);
+        rcl_guard_condition_fini(&lidar_rpm_condition);
         rclc_support_fini(&support);
     }
 }
@@ -279,29 +401,14 @@ struct lidar_ray {
 
 void lidar_task(__unused void* param) {
     // LiDAR scan storage
-    sensor_msgs__msg__LaserScan lidar_scan_msg;
-    lidar_scan_msg.angle_min = 0;
-    lidar_scan_msg.angle_max = 2 * PI;
-    lidar_scan_msg.angle_increment = PI / 180.f;
-    lidar_scan_msg.time_increment = (1.f / 5.f) / 360.f;
-    lidar_scan_msg.scan_time = (1.f / 5.f);
-    lidar_scan_msg.range_min = 0.15f;
-    lidar_scan_msg.range_max = 6.0f;
-
-    char *frame_id = strdup("map");
-    lidar_scan_msg.header.frame_id.data = frame_id;
-    lidar_scan_msg.header.frame_id.size = 3;
-    lidar_scan_msg.header.frame_id.capacity = 3;
-
-    float scans[360];
-    lidar_scan_msg.ranges.data = scans;
-    lidar_scan_msg.ranges.size = 360;
-    lidar_scan_msg.ranges.capacity = 360;
-
-    float intensities[360];
-    lidar_scan_msg.intensities.data = intensities;
-    lidar_scan_msg.intensities.size = 360;
-    lidar_scan_msg.intensities.capacity = 360;
+    LidarMsg messages[4]{};
+    for (int i = 0; i < 4; i++) {
+        LidarMsg *msg = &messages[i];
+        if (xQueueSend(lidar_scan_release_queue, &msg, 0) != pdPASS) {
+            // TODO: better handling of release queue addition failure
+            vTaskDelete(nullptr);
+        }
+    }
 
     while (true) {
         constexpr float lidar_Kp = 0.02f;
@@ -318,9 +425,21 @@ void lidar_task(__unused void* param) {
         lidar_read_pos = 0;
         lidar_write_pos = 0;
 
+        // get next available lidar message
+        LidarMsg *msg = nullptr;
+
         // LiDAR packet loop
         int index = 0;
         while (!stop_publishers && !error_detected) {
+            // if msg is currently null, get a new message
+            if (msg == nullptr) {
+                if (xQueueReceive(lidar_scan_release_queue, &msg, 0) ==
+                        errQUEUE_EMPTY) {
+                    continue;
+                }
+            }
+
+            // get LiDAR packet
             uint8_t buffer[22];
             if (!lidar_get_packet(buffer)) {
                 lidar_synchronize();
@@ -333,20 +452,22 @@ void lidar_task(__unused void* param) {
             float rpm = (float) rpm_raw / 64.f;
             float response = lidar_pid.compute(rpm, 1.f / 450.f, nullptr, nullptr, nullptr,
                     [] (float a, float b) {return b - a;});
+
+            if (response > 0.5f) response = 0.5f;
             set_motor_lidar_speed(response);
 
             // header timestamp is acquisition time of first ray in scan
             if (index == 0) {
                 auto now = time_us_64();
-                lidar_scan_msg.header.stamp.sec = now / 1000000;
-                lidar_scan_msg.header.stamp.nanosec = (now % 1000000) * 1000;
+                msg->scan.header.stamp.sec = now / 1000000;
+                msg->scan.header.stamp.nanosec = (now % 1000000) * 1000;
             }
 
             // Compute distances
             lidar_ray *rays = reinterpret_cast<lidar_ray*>(&buffer[4]);
             for (int j = 0; j < 4; j++) {
-                scans[index + j] = ((float) rays[j].distance) / 1000.f;
-                intensities[index + j] = rays[j].intensity;
+                msg->scans[index + j] = ((float) rays[j].distance) / 1000.f;
+                msg->intensities[index + j] = rays[j].intensity;
             }
 
             // Publish message when scan is complete
@@ -354,21 +475,23 @@ void lidar_task(__unused void* param) {
             if (index >= 360) {
                 index = 0;
 
+                // publish laser rpm
+                xQueueSend(lidar_rpm_queue, &rpm, 0);
+                rcl_trigger_guard_condition(&lidar_rpm_condition);
+
                 // publish laser scan
                 if (rpm > 280.f && rpm < 320.f) {
-                    std_msgs__msg__Float32 rpm_msg = { .data = rpm };
-                    auto rc = rcl_publish(&lidar_rpm_publisher, &rpm_msg, NULL);
-                    if (rc != RCL_RET_OK) {
-                        error_detected = true;
-                        break;
-                    }
-
-                    rc = rcl_publish(&lidar_scan_publisher, &lidar_scan_msg, NULL);
-                    if (rc != RCL_RET_OK) {
-                        error_detected = true;
+                    if (xQueueSend(lidar_scan_queue, &msg, 0) == pdPASS) {
+                        rcl_trigger_guard_condition(&lidar_scan_condition);
+                        msg = nullptr;
                     }
                 }
             }
+        }
+
+        // requeue message if we have a pending one
+        if (msg != nullptr) {
+            xQueueSend(lidar_scan_release_queue, &msg, portMAX_DELAY);
         }
 
         // shut down lidar
@@ -568,6 +691,11 @@ int main(void) {
 
     // setup semaphores
     lidar_task_semaphore = xSemaphoreCreateBinary();
+
+    // setup queues
+    lidar_scan_queue = xQueueCreate(4, sizeof(size_t));
+    lidar_scan_release_queue = xQueueCreate(4, sizeof(size_t));
+    lidar_rpm_queue = xQueueCreate(4, sizeof(float));
 
     // start tasks
     xTaskCreate(main_task, "Executor", 16384, nullptr, tskIDLE_PRIORITY + 1U, &main_task_handle);
